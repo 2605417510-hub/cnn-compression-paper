@@ -30,39 +30,18 @@ import time
 
 import torch
 import torch.nn as nn
-from torchvision import models
-
-NUM_CLASSES = {"cifar10": 10, "cifar100": 100}
-
-
-def build_resnet18(num_classes):
-    m = models.resnet18(weights=None)
-    m.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
-    m.maxpool = nn.Identity()
-    m.fc = nn.Linear(m.fc.in_features, num_classes)
-    return m
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from models.cifar_models import (
+    build_model, MODEL_BUILDERS, NUM_CLASSES, NORM, INPUT_SIZE)
 
 
-def build_mobilenetv2(num_classes):
-    m = models.mobilenet_v2(weights=None)
-    m.features[0][0].stride = (1, 1)
-    blk = m.features[2]
-    blk.conv[1][0].stride = (1, 1)
-    blk.stride = 1
-    m.classifier[1] = nn.Linear(m.last_channel, num_classes)
-    return m
 
-
-MODEL_BUILDERS = {
-    "resnet18": build_resnet18,
-    "mobilenetv2": build_mobilenetv2,
-}
 
 
 def load_model(args):
-    num_classes = NUM_CLASSES[args.dataset]
     if args.random:
-        return MODEL_BUILDERS[args.model](num_classes)
+        return build_model(args.model, args.dataset)
 
     obj = torch.load(args.ckpt, map_location="cpu")
 
@@ -75,7 +54,7 @@ def load_model(args):
 
     if not args.model:
         raise SystemExit("this checkpoint holds only weights; pass --model")
-    m = MODEL_BUILDERS[args.model](num_classes)
+    m = build_model(args.model, args.dataset)
     state = obj["model"] if isinstance(obj, dict) and "model" in obj else obj
     m.load_state_dict(state)
     return m

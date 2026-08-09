@@ -27,6 +27,12 @@ import torch
 import torch.nn as nn
 from torchvision import models
 
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from models.cifar_models import (
+    build_model, MODEL_BUILDERS, NUM_CLASSES, NORM, INPUT_SIZE)
+
+
 try:
     import torch.ao.nn.quantized as nnq
     import torch.ao.nn.intrinsic.quantized as nniq
@@ -34,32 +40,8 @@ try:
 except ImportError:
     HAS_QUANT = False
 
-NUM_CLASSES = {"cifar10": 10, "cifar100": 100}
 
 
-# --------------------------------------------------------------- model build
-def build_resnet18(num_classes):
-    m = models.resnet18(weights=None)
-    m.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
-    m.maxpool = nn.Identity()
-    m.fc = nn.Linear(m.fc.in_features, num_classes)
-    return m
-
-
-def build_mobilenetv2(num_classes):
-    m = models.mobilenet_v2(weights=None)
-    m.features[0][0].stride = (1, 1)
-    blk = m.features[2]
-    blk.conv[1][0].stride = (1, 1)
-    blk.stride = 1
-    m.classifier[1] = nn.Linear(m.last_channel, num_classes)
-    return m
-
-
-MODEL_BUILDERS = {
-    "resnet18": build_resnet18,
-    "mobilenetv2": build_mobilenetv2,
-}
 
 
 # --------------------------------------------------------------- layer types
@@ -220,22 +202,20 @@ def main():
     p.add_argument("--name", default=None, help="config id for the JSON")
     args = p.parse_args()
 
-    num_classes = NUM_CLASSES[args.dataset]
-
     if args.ckpt:
         obj = torch.load(args.ckpt, map_location="cpu")
         if isinstance(obj, dict) and "model" in obj:
-            model = MODEL_BUILDERS[args.model](num_classes)
+            model = build_model(args.model, args.dataset)
             model.load_state_dict(obj["model"])
         elif isinstance(obj, nn.Module):
             # pruned models are saved as whole modules, since the
             # architecture no longer matches the builder
             model = obj
         else:
-            model = MODEL_BUILDERS[args.model](num_classes)
+            model = build_model(args.model, args.dataset)
             model.load_state_dict(obj)
     elif args.random:
-        model = MODEL_BUILDERS[args.model](num_classes)
+        model = build_model(args.model, args.dataset)
     else:
         raise SystemExit("give --ckpt PATH or --random")
 
