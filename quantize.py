@@ -60,6 +60,8 @@ from torchvision import datasets, transforms
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from models.cifar_models import (
     build_model, MODEL_BUILDERS, NUM_CLASSES, NORM, INPUT_SIZE)
+from profile_model import profile
+from latency import measure
 
 
 def set_seed(seed):
@@ -119,6 +121,19 @@ def file_mb(path):
     return os.path.getsize(path) / 1024.0 / 1024.0
 
 
+def make_quantized_model(model_fp32, qconfig_mapping, example_inputs, calib_loader):
+    """Prepare, calibrate, and convert a fresh copy of an FP32 model."""
+    to_quant = copy.deepcopy(model_fp32).eval().cpu()
+    prepared = quantize_fx.prepare_fx(to_quant, qconfig_mapping, example_inputs)
+
+    t0 = time.time()
+    with torch.no_grad():
+        for x, _ in calib_loader:
+            prepared(x)
+
+    return quantize_fx.convert_fx(prepared), time.time() - t0
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--model", choices=list(MODEL_BUILDERS), required=True)
@@ -129,6 +144,10 @@ def main():
     p.add_argument("--calib-size", type=int, default=1024)
     p.add_argument("--batch-size", type=int, default=128)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--warmup", type=int, default=20)
+    p.add_argument("--repeats", type=int, default=100)
+    p.add_argument("--skip-rebuild-verify", action="store_true",
+                   help="skip the state-dict reconstruction check")
     p.add_argument("--out-dir", default=".")
     args = p.parse_args()
 
@@ -169,10 +188,9 @@ def main():
     qconfig_mapping = get_default_qconfig_mapping("fbgemm")
     example_inputs = (torch.randn(*INPUT_SIZE),)
 
-    to_quant = copy.deepcopy(model_fp32)
     try:
-        prepared = quantize_fx.prepare_fx(to_quant, qconfig_mapping,
-                                          example_inputs)
+        model_int8, calib_seconds = make_quantized_model(
+            model_fp32, qconfig_mapping, example_inputs, calib_loader)
     except Exception as e:
         print("\nFX symbolic tracing FAILED:")
         print("  %s" % e)
@@ -181,31 +199,62 @@ def main():
         print("call fuse_modules by hand. Roughly half a day of work.")
         raise SystemExit(1)
 
-    t0 = time.time()
-    with torch.no_grad():
-        for x, _ in calib_loader:
-            prepared(x)
-    print("calibrated    : %.1fs" % (time.time() - t0))
-
-    model_int8 = quantize_fx.convert_fx(prepared)
+    print("calibrated    : %.1fs" % calib_seconds)
 
     # ------------------------------------------------------------ INT8 side
     t0 = time.time()
     acc_int8 = evaluate(model_int8, test_loader)
     print("INT8 accuracy : %.2f%%   (%.1fs)" % (acc_int8 * 100, time.time() - t0))
 
-    ckpt_path = os.path.join(args.out_dir, "checkpoints", name + "_best.pth")
-    torch.save(model_int8, ckpt_path)
+    # The FX GraphModule is not portable as a whole torch.save() object on
+    # this PyTorch version. Measure it while it is still in memory, then save
+    # only its state dict plus the deterministic reconstruction recipe.
+    profile_res = profile(model_int8)
+
+    ckpt_path = os.path.join(args.out_dir, "checkpoints",
+                             name + "_state_dict.pth")
+    artifact = {
+        "format": "fx_quantized_state_dict_v1",
+        "state_dict": model_int8.state_dict(),
+        "model": args.model,
+        "dataset": args.dataset,
+        "source_ckpt": args.ckpt,
+        "backend": "fbgemm",
+        "calib_size": args.calib_size,
+        "calib_split": "train",
+        "seed": args.seed,
+        "torch_version": torch.__version__,
+    }
+    torch.save(artifact, ckpt_path)
     int8_size = file_mb(ckpt_path)
 
-    # ------------------------------------------------------------ verify
-    # Saving a quantized GraphModule and loading it back is the step most
-    # likely to break silently, so check it here rather than discover it
-    # later in the profiler.
-    reloaded = torch.load(ckpt_path, map_location="cpu")
-    acc_reload = evaluate(reloaded, test_loader, limit=2048)
-    acc_int8_head = evaluate(model_int8, test_loader, limit=2048)
-    reload_ok = abs(acc_reload - acc_int8_head) < 1e-6
+    # ------------------------------------------------------------ rebuild verify
+    # A direct torch.load(model_int8) fails for fused quantized FX modules.
+    # Instead, rebuild the graph from the FP32 source and load its state dict.
+    # This costs one extra calibration pass but proves that the saved artifact
+    # is reproducible without depending on GraphModule pickling.
+    rebuild_ok = None
+    rebuild_error = None
+    acc_rebuilt = None
+    if not args.skip_rebuild_verify:
+        try:
+            saved = torch.load(ckpt_path, map_location="cpu")
+            rebuilt, _ = make_quantized_model(
+                model_fp32, qconfig_mapping, example_inputs, calib_loader)
+            rebuilt.load_state_dict(saved["state_dict"], strict=True)
+            acc_rebuilt = evaluate(rebuilt, test_loader, limit=2048)
+            acc_int8_head = evaluate(model_int8, test_loader, limit=2048)
+            rebuild_ok = abs(acc_rebuilt - acc_int8_head) < 1e-6
+            if not rebuild_ok:
+                rebuild_error = "reconstructed model disagrees with in-memory model"
+        except Exception as e:
+            rebuild_ok = False
+            rebuild_error = "%s: %s" % (type(e).__name__, e)
+
+    # Keep timing last: measure() pins PyTorch to one CPU thread.
+    latency_res = measure(model_int8, INPUT_SIZE, args.warmup, args.repeats)
+    latency_spread = (latency_res["latency_ms_std"] /
+                      latency_res["latency_ms_median"] * 100.0)
 
     print("-" * 62)
     print("accuracy      : %.2f%% -> %.2f%%   (delta %+.2f)"
@@ -213,10 +262,15 @@ def main():
     print("file size     : %.2f MB -> %.2f MB   (%.2fx smaller)"
           % (fp32_size, int8_size,
              fp32_size / int8_size if int8_size else 0.0))
-    print("save/reload   : %s" % ("OK" if reload_ok else "MISMATCH"))
-    if not reload_ok:
-        print("  the reloaded model disagrees with the in-memory one.")
-        print("  do not trust this checkpoint.")
+    if rebuild_ok is None:
+        print("save/rebuild  : SKIPPED")
+    else:
+        print("save/rebuild  : %s" % ("OK" if rebuild_ok else "FAILED"))
+    if rebuild_error:
+        print("  %s" % rebuild_error)
+    print("median latency: %.3f ms" % latency_res["latency_ms_median"])
+    print("stability     : std/median = %.1f%%   %s" % (
+        latency_spread, "OK" if latency_spread < 5.0 else "TOO NOISY"))
     print("=" * 62)
 
     if acc_fp32 - acc_int8 > 0.02:
@@ -224,7 +278,9 @@ def main():
         print("  Likely the depthwise layers. Options: keep the stem and the")
         print("  classifier in FP32 (mixed precision), and report it.")
 
-    meta = {
+    metrics = dict(profile_res)
+    metrics.update(latency_res)
+    metrics.update({
         "name": name,
         "model": args.model,
         "dataset": args.dataset,
@@ -242,15 +298,20 @@ def main():
         "acc_delta": acc_int8 - acc_fp32,
         "file_mb_fp32": fp32_size,
         "file_mb_int8": int8_size,
-        "reload_verified": reload_ok,
+        "checkpoint_format": artifact["format"],
+        "checkpoint_path": ckpt_path,
+        "rebuild_verified": rebuild_ok,
+        "rebuild_accuracy_head": acc_rebuilt,
+        "rebuild_error": rebuild_error,
+        "latency_std_over_median_pct": latency_spread,
         "torch_version": torch.__version__,
-    }
-    meta_path = os.path.join(args.out_dir, "metrics", name + "_quant.json")
+    })
+    meta_path = os.path.join(args.out_dir, "metrics", name + ".json")
     with open(meta_path, "w") as f:
-        json.dump(meta, f, indent=2)
+        json.dump(metrics, f, indent=2)
 
-    print("saved  : %s" % ckpt_path)
-    print("meta   : %s" % meta_path)
+    print("saved state dict : %s" % ckpt_path)
+    print("metrics          : %s" % meta_path)
 
 
 if __name__ == "__main__":
