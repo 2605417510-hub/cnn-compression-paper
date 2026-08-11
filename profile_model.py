@@ -155,7 +155,10 @@ class Profiler:
 
     def run(self, example_input):
         for name, m in self.model.named_modules():
-            if is_leaf(m) and isinstance(m, self.CONV + self.LINEAR):
+            # Quantized Linear keeps a LinearPackedParams child, so it is not
+            # technically a leaf module. The packed child is not a profiled
+            # layer itself; register the supported parent directly.
+            if isinstance(m, self.CONV + self.LINEAR):
                 self.handles.append(m.register_forward_hook(self._hook(name)))
 
         self.model.eval()

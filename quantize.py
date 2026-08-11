@@ -178,6 +178,7 @@ def main():
     print("FP32 accuracy : %.2f%%   (%.1fs)" % (acc_fp32 * 100, time.time() - t0))
 
     fp32_size = file_mb(args.ckpt)
+    fp32_profile = profile(model_fp32)
 
     # ------------------------------------------------------------ calibrate
     calib_loader = make_calib_loader(train_set, args.calib_size,
@@ -210,6 +211,20 @@ def main():
     # this PyTorch version. Measure it while it is still in memory, then save
     # only its state dict plus the deterministic reconstruction recipe.
     profile_res = profile(model_int8)
+    if profile_res["macs"] != fp32_profile["macs"]:
+        raise RuntimeError(
+            "INT8 MAC count changed unexpectedly: FP32 %d, INT8 %d"
+            % (fp32_profile["macs"], profile_res["macs"]))
+
+    # Quantization folds batch-normalization parameters into adjacent
+    # convolutions. Preserve the FP32 architecture's parameter-count fields
+    # for a like-for-like compression-matrix comparison, while retaining the
+    # actual INT8 storage count as separate metadata.
+    profile_res["params_int8_storage"] = profile_res["params"]
+    profile_res["params_conv_linear_int8_storage"] = (
+        profile_res["params_conv_linear"])
+    profile_res["params"] = fp32_profile["params"]
+    profile_res["params_conv_linear"] = fp32_profile["params_conv_linear"]
 
     ckpt_path = os.path.join(args.out_dir, "checkpoints",
                              name + "_state_dict.pth")
@@ -300,6 +315,7 @@ def main():
         "file_mb_int8": int8_size,
         "checkpoint_format": artifact["format"],
         "checkpoint_path": ckpt_path,
+        "macs_fp32_verified": fp32_profile["macs"],
         "rebuild_verified": rebuild_ok,
         "rebuild_accuracy_head": acc_rebuilt,
         "rebuild_error": rebuild_error,
