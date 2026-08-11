@@ -66,10 +66,14 @@ def stability_pct(data, path):
 def make_row(fp32, int8, fp32_path, int8_path):
     name = require(int8, "name", int8_path)
     model, pruning = parse_name(name)
-    expected_fp32_name = name.replace("_int8_", "_fp32_")
-    if require(fp32, "name", fp32_path) != expected_fp32_name:
-        raise ValueError("metric pair name mismatch: %s vs %s" % (
-            fp32_path, int8_path))
+    # The MobileNetV2 p00 FP32 JSON predates the short "mbv2" convention and
+    # retains its training tag in the embedded display name. Pairing is based
+    # on the deterministic matching filename created above, not that display
+    # field. Validate the model and dataset fields instead.
+    if require(fp32, "model", fp32_path) != require(int8, "model", int8_path):
+        raise ValueError("model mismatch: %s vs %s" % (fp32_path, int8_path))
+    if require(fp32, "dataset", fp32_path) != require(int8, "dataset", int8_path):
+        raise ValueError("dataset mismatch: %s vs %s" % (fp32_path, int8_path))
 
     fp32_macs = require(fp32, "macs", fp32_path)
     int8_macs = require(int8, "macs", int8_path)
